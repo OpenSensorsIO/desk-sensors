@@ -1,5 +1,5 @@
 # Desk Sensor Stuff
-The name for this repo ("arduino") is slightly misleading. It contains the Arduino code for the RFu328 ultrasonic desk sensor as well as the Node-RED flow for the hub device and the PCB EAGLE files.
+This repo contains the Arduino code for the RFu328 ultrasonic desk sensor as well as the Node-RED flow for the hub device and the PCB EAGLE files.
 
 Check out localhost:1880/status for output from the sensors.
 
