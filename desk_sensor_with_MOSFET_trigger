@@ -1,0 +1,214 @@
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// ULTRASONIC ("DESK OCCUPANCY") DEVICE FIRMWARE v0.2 RELEASE
+//
+// (C) 2015 by Boris Adryan, badryan@gmail.com, for OpenSensors.IO
+//
+// Feel free to share under Apache 2 license.
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// HC-SR04 ultrasonic sensor on Wirelessthings RFu328
+//
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// The RFu328 is in hardware sleep (mediated by the onboard SRF radio) and awakes periodically from
+// SHORTSLEEP to take a measurement with the HC-SR04 (based on https://code.google.com/p/arduino-new-ping/).
+// Every INTERATIONS_SLEEPCHECK the radio stays awake for SLEEPCHECK_TIMEOUT milliseconds and sends a
+// CHECKTIME message. This is acknowledged by the remote station with a xxSLEEP message, where xx is
+// the number of hours the RFu328 is going into deep sleep before going into the SHORTSLEEP iterations again
+// 
+// BUGFIXING PROTIP: Hardware sleep can be interrupted by shortening SRF pin 11 (lowest lateral left) to GND
+// 
+// RFu-328 specific AT commands (requires firmware RFu-328 V0.84 or better) -- implementation and hints from
+// https://github.com/CisecoPlc/LLAPSerial/blob/master/examples/VeryLowPower_RFu328_ATSM3/).
+//    The following RFu specific AT commands are supported in V0.84 or later
+//		Added a new sleep mode (ATSM3) Wake after timed interval
+//			The duration is specified by a new command ATSD, units are mS 
+//			and the range is 32bit (max approx. 49 days)
+//				e.g. ATSD5265C00 is one day (hex 5265C00 is decimal 86400000)
+//				ATSD36EE80 is one hour
+//				ATSD493E0 is five minutes
+//		This sleep mode can be used to wake the 328 after a timed interval 
+//			by connecting RFu-328 pin 7 to pin 19, D3(INT1) or 20, D2(INT0).
+//		Using this technique means that a RFu-328 can sleep for a timed 
+//			period consuming about 0.6uA, instead of using the AVR328 watchdog (for timing) 
+//			which uses around 7uA.
+//
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+#include <NewPing.h>
+#include <LLAPSerial.h>
+
+#define TRIGGER_PIN    3  // Arduino pin tied to trigger pin on the ultrasonic sensor.
+#define ECHO_PIN       5  // Arduino pin tied to echo pin on the ultrasonic sensor.
+#define POD_PIN        6  // Arduino pin to trigger MOSFET that enables 5V pod.
+#define RADIO_PIN      8  // pin 8 controls the radio
+#define SLEEP_PIN      4  // pin 4 controls the radio sleep
+#define WAKE_PIN       2  // the one that connects to pin 7/D11
+#define BLINK_PIN     12  // pin 12 blinks the status LED
+#define MAX_DISTANCE 300 // maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
+
+#define ITERATIONS_SLEEPCHECK 60 // check for SLEEPCHECK_TIMEOUT ms all ITERATIONS_SLEEPCHECK iterations
+#define SLEEPCHECK_TIMEOUT 1000 //
+
+// ATSD1388 - 5 sec; ATSD4E20 - 20 sec; ATSD493E0 - 5 min; ATSDEA60 - 1 min; ATSD1B7740 - 30 min; ATSD36EE80 - 60 min
+#define SHORTSLEEP "ATSDEA60"
+
+/////////////////////////////////////////////////////////
+// SRF AT command handling
+/////////////////////////////////////////////////////////
+
+uint8_t setupSRF(char* sleepString) {	// set Sleep mode 2
+    if (!enterCommandMode()) {	        // if failed once then try again
+	if (!enterCommandMode()) return 1;
+    }     
+    if (!sendCommand(sleepString)) return 2;
+    if (!sendCommand("ATSM3")) return 3;
+    if (!sendCommand("ATDN")) return 4;
+    return 5;
+}
+
+uint8_t enterCommandMode() {
+  delay(1200);
+  Serial.print("+++");
+  delay(500);
+  while (Serial.available()) Serial.read();  // flush serial in
+  delay(500);
+  return checkOK(500);
+}
+
+uint8_t sendCommand(char* lpszCommand) {
+  Serial.print(lpszCommand);
+  Serial.write('\r');
+  return checkOK(100);
+}
+
+uint8_t checkOK(int timeout) {
+  uint32_t time = millis();
+    while (millis() - time < timeout) {
+        if (Serial.available() >= 3) {
+            if (Serial.read() != 'O') continue;
+            if (Serial.read() != 'K') continue;
+            if (Serial.read() != '\r') continue;
+          return 1;
+        }
+    }
+  return 0;
+}
+
+//////////////////////////////////////////
+// HIGHER ORDER SLEEP PROCDURES
+//////////////////////////////////////////
+uint8_t trysleep(char* sleepString) {
+  uint8_t val = 0;
+    while ((val = setupSRF(sleepString)) != 5) {
+      LLAP.sendInt("ERR",val); // Diagnostic
+      delay(5000);	// try again in 5 seconds
+    }
+  return val;  
+}
+
+uint8_t checklongsleep() {
+  LLAP.sendMessage("CHECKTIME");
+  
+  char r[7] = {' ',' ',' ',' ',' ',' ',' '};
+  uint32_t time = millis();
+    while (millis() - time < SLEEPCHECK_TIMEOUT) {
+        if (Serial.available()) {
+          int i = 0;  
+            while (i < 6) {
+              r[i] = r[i+1];
+              i++;
+            }
+          r[6] = Serial.read();
+        }
+            
+        if (r[2] == 'S' && r[3] == 'L' && r[4] == 'E' && r[5] == 'E' && r[6] == 'P') {
+          // r[0]+r[1] to contain hours to sleep
+          unsigned long hours = (r[0]-48)*10+r[1]-48; // r contains the ASCII value, so -48 returns the actual number value. r[0] first digit, r[1] second digit
+          LLAP.sendInt("ACKDOWN", hours);
+          String sleepHex = "ATSD"+String(hours * 60 * 60 * 1000, HEX); // delivers the HEX value of milliseconds to sleep and does the type conversion to char
+          int str_len = sleepHex.length() + 1; 
+          char ATSDcharString[str_len];
+          sleepHex.toCharArray(ATSDcharString, str_len);
+              
+          trysleep(ATSDcharString);
+          pinMode(SLEEP_PIN, INPUT);     // sleep the radio
+          LLAP.sleep(WAKE_PIN, RISING, false);  // sleep until woken
+          pinMode(SLEEP_PIN, OUTPUT);    // wake the radio
+              
+          trysleep(SHORTSLEEP);
+        }        
+    }
+}
+
+/////////////////////////////////////////
+// SETUP OF DEVICE AND LOOP
+/////////////////////////////////////////
+
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+long iterationsAwake = 0;
+
+void setup() {
+  Serial.begin(115200); // Open serial monitor at 115200 baud to see ping results.
+  
+  //// generate a random name (device ID), here: a pseudo-hexadecimal value
+  char a[22] = {'0','1', '2', '3', '4', '5', '6', '7', '8','9','A','B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'};
+  char devID[2];
+  randomSeed(analogRead(11));
+  devID[0] = a[random(0, 22)];
+  devID[1] = a[random(0, 22)];
+  
+  LLAP.init(devID);
+  
+  ///// init the hardware
+  pinMode(POD_PIN, OUTPUT);
+  digitalWrite(POD_PIN, LOW);
+  pinMode(BLINK_PIN, OUTPUT);
+  digitalWrite(BLINK_PIN, LOW);
+  pinMode(RADIO_PIN, OUTPUT);    // initialize pin 8 to control the radio
+  digitalWrite(RADIO_PIN, HIGH); // select the radio
+  pinMode(SLEEP_PIN, OUTPUT);    // define sleep pin
+  digitalWrite(SLEEP_PIN, LOW);  // wake the radio
+  
+  delay(400);
+  
+  ////// tell the world you're alive
+  uint8_t val = 0;
+    while (val < 3) {      
+      LLAP.sendMessage(F("STARTED"));  
+      val++;  
+    }
+ 
+  trysleep(SHORTSLEEP);
+    
+}
+
+void loop() {
+  pinMode(SLEEP_PIN, INPUT);     // sleep the radio
+  LLAP.sleep(WAKE_PIN, RISING, false);  // sleep until woken
+  pinMode(SLEEP_PIN, OUTPUT);    // wake the radio
+  
+  digitalWrite(POD_PIN, HIGH);
+  delay(1500);                     // wait 150ms after wakeup 
+  unsigned int uS = sonar.ping();  // send ping, get ping time in microseconds (uS).
+  delay(50);
+  uS = sonar.ping();
+  delay(50);
+  uS = sonar.ping();
+  
+  int dist = uS / US_ROUNDTRIP_CM;
+  digitalWrite(POD_PIN, LOW);
+  
+  LLAP.sendInt("CM", dist);      // send ping distance in cm
+  digitalWrite(BLINK_PIN, HIGH); // blink briefly
+  delay(100);
+  digitalWrite(BLINK_PIN, LOW);
+  
+  iterationsAwake++;
+    if (iterationsAwake == ITERATIONS_SLEEPCHECK) {
+      iterationsAwake = 0;
+      checklongsleep();
+   }
+
+}
